@@ -1,0 +1,60 @@
+openapi: 3.0.3
+info:
+  title: Incident Digest API
+  version: 0.1.0
+  description: |
+    Analyzes software incident alerts and stack traces to provide 
+    a concise summary and recommended next action for on-call engineers.
+paths:
+  /api/v1/digest:
+    post:
+      summary: Generate an incident digest
+      operationId: generateDigest
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required:
+                - title
+                - description
+              properties:
+                title:
+                  type: string
+                  description: The short title or subject of the incident alert.
+                severity:
+                  type: string
+                  description: The priority level (e.g., P1, P2, SEV-1).
+                description:
+                  type: string
+                  description: The raw text, logs, or stack trace of the incident. Max 20,000 chars.
+      responses:
+        '200':
+          description: Successful digest generation
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  summary:
+                    type: string
+                    description: A human-readable synthesis of the failing component and reason.
+                  recommended_action:
+                    type: string
+                    description: The immediate next step the engineer should take.
+        '400':
+          description: Bad Request (Invalid schema or missing fields)
+        '401':
+          description: Unauthorized (Missing or invalid token)
+        '502':
+          description: Bad Gateway (Upstream AI provider error)
+        '504':
+          description: Gateway Timeout (AI provider took longer than 60s)
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
