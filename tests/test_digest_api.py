@@ -27,6 +27,7 @@ import llm_client
 from llm_client import LLMProviderError, LLMTimeoutError
 from main import app
 from schemas import MAX_DESCRIPTION_LENGTH
+from tools import get_service_runbook
 
 TEST_BEARER_TOKEN = "test-static-bearer-token-12345"
 AUTH_HEADERS = {"Authorization": f"Bearer {TEST_BEARER_TOKEN}"}
@@ -394,12 +395,98 @@ async def test_llm_client_enforces_timeout_and_token_budget(
         side_effect=simulated_slow_gemini_call
     )
 
-    with patch("llm_client._create_genai_client", return_value=mock_genai_client):
-        with pytest.raises(LLMTimeoutError):
-            await llm_client.generate_digest_raw(
-                system_prompt="System prompt",
-                incident_payload={"title": "Test", "description": "Test"},
-            )
+    await llm_client.init_mcp_client()
+    try:
+        with patch("llm_client._create_genai_client", return_value=mock_genai_client):
+            with pytest.raises(LLMTimeoutError):
+                await llm_client.generate_digest_raw(
+                    system_prompt="System prompt",
+                    incident_payload={"title": "Test", "description": "Test"},
+                )
+    finally:
+        await llm_client.close_mcp_client()
 
     call_kwargs = mock_genai_client.aio.models.generate_content.call_args.kwargs
     assert call_kwargs["config"].max_output_tokens == 500
+    discovered_tool_names = [
+        decl.name
+        for tool in (call_kwargs["config"].tools or [])
+        for decl in (getattr(tool, "function_declarations", None) or [])
+    ]
+    assert "get_service_runbook" in discovered_tool_names
+
+
+@pytest.mark.asyncio
+async def test_llm_client_handles_tool_call_and_returns_final_response() -> None:
+    """Verify llm_client executes get_service_runbook via the persistent MCP client and returns the final response."""
+    first_response = SimpleNamespace(
+        function_calls=[
+            SimpleNamespace(name="get_service_runbook", args={"service_name": "payments"})
+        ],
+        candidates=[
+            SimpleNamespace(
+                content=SimpleNamespace(
+                    role="model",
+                    parts=[
+                        SimpleNamespace(
+                            function_call=SimpleNamespace(
+                                name="get_service_runbook",
+                                args={"service_name": "payments"},
+                            )
+                        )
+                    ],
+                )
+            )
+        ],
+        text=None,
+    )
+    second_response = SimpleNamespace(
+        function_calls=None,
+        candidates=[],
+        text=json.dumps(
+            {
+                "summary": "Payment service gateway pod is failing.",
+                "recommended_action": "Restart the payment-gateway pod and check Stripe API status.",
+            }
+        ),
+    )
+
+    mock_genai_client = MagicMock()
+    mock_genai_client.aio.models.generate_content = AsyncMock(
+        side_effect=[first_response, second_response]
+    )
+
+    from main import lifespan
+
+    async with lifespan(app):
+        assert llm_client.get_mcp_client() is not None
+        assert getattr(app.state, "mcp_session", None) is not None
+
+        with patch("llm_client._create_genai_client", return_value=mock_genai_client):
+            result = await llm_client.generate_digest_raw(
+                system_prompt="System prompt",
+                incident_payload={
+                    "title": "Payments service outage",
+                    "description": "502 errors from payment-gateway",
+                },
+            )
+
+    assert llm_client.get_mcp_client() is None
+    assert getattr(app.state, "mcp_session", None) is None
+
+    assert json.loads(result) == {
+        "summary": "Payment service gateway pod is failing.",
+        "recommended_action": "Restart the payment-gateway pod and check Stripe API status.",
+    }
+    assert mock_genai_client.aio.models.generate_content.await_count == 2
+
+    second_call_kwargs = mock_genai_client.aio.models.generate_content.call_args_list[1].kwargs
+    conversation_contents = second_call_kwargs["contents"]
+    assert isinstance(conversation_contents, list)
+    assert len(conversation_contents) == 3
+    tool_response_part = conversation_contents[2].parts[0]
+    assert tool_response_part.function_response.name == "get_service_runbook"
+    assert (
+        tool_response_part.function_response.response["result"]
+        == get_service_runbook("payments")
+    )

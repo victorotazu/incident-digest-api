@@ -74,22 +74,37 @@ SYSTEM_PROMPT: str = load_system_prompt()
 
 @asynccontextmanager
 async def lifespan(app_instance: FastAPI) -> AsyncIterator[None]:
-    """Load the system prompt once at application startup and store it in global state."""
+    """Load the system prompt and initialize the global MCP client at startup, closing it on shutdown."""
     global SYSTEM_PROMPT
     SYSTEM_PROMPT = load_system_prompt()
     app_instance.state.system_prompt = SYSTEM_PROMPT
+
+    mcp_session = await llm_client.init_mcp_client()
+    app_instance.state.mcp_session = mcp_session
+    logger.info(
+        "MCP client connected during application startup",
+        extra={
+            "event": "mcp_startup_connected",
+            "mcp_connected": True,
+        },
+    )
     logger.info(
         "Incident Digest API startup complete",
         extra={
             "event": "application_startup",
             "system_prompt_length": len(SYSTEM_PROMPT),
+            "mcp_connected": True,
         },
     )
-    yield
-    logger.info(
-        "Incident Digest API shutting down",
-        extra={"event": "application_shutdown"},
-    )
+    try:
+        yield
+    finally:
+        await llm_client.close_mcp_client()
+        app_instance.state.mcp_session = None
+        logger.info(
+            "Incident Digest API shutting down",
+            extra={"event": "application_shutdown"},
+        )
 
 
 app = FastAPI(
@@ -216,6 +231,7 @@ async def request_validation_exception_handler(
     },
 )
 async def generate_digest(
+    request: Request,
     payload: IncidentDigestRequest,
     _token: str = Depends(verify_bearer_token),
 ) -> IncidentDigestResponse:
@@ -239,10 +255,12 @@ async def generate_digest(
 
     try:
         hardened_system_prompt = f"{UNTRUSTED_PAYLOAD_WARNING}\n\n{SYSTEM_PROMPT}"
+        mcp_session = getattr(request.app.state, "mcp_session", None) or llm_client.get_mcp_client()
 
         raw_llm_output = await llm_client.generate_digest_raw(
             system_prompt=hardened_system_prompt,
             incident_payload=incident_dict,
+            mcp_session=mcp_session,
         )
 
         response = IncidentDigestResponse.from_llm_raw(raw_llm_output)
