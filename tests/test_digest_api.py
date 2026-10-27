@@ -26,8 +26,8 @@ if str(PROJECT_ROOT) not in sys.path:
 import llm_client
 from llm_client import LLMProviderError, LLMTimeoutError
 from main import app
+from mcp_server import get_service_runbook
 from schemas import MAX_DESCRIPTION_LENGTH
-from tools import get_service_runbook
 
 TEST_BEARER_TOKEN = "test-static-bearer-token-12345"
 AUTH_HEADERS = {"Authorization": f"Bearer {TEST_BEARER_TOKEN}"}
